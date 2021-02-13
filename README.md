@@ -2,11 +2,11 @@
 Receive time and date via WLAN / NTP and transmit wired as DCF77
 
 # Active Components
-- ESP-01 WLAn module
+- ESP-01 WLAN module
 - LF33 voltage regulator
 
 # Tools
-- Schematic KiCAD
+- Schematic KiCAD (no layout yet)
 - Adurino IDE
 
 # Applications

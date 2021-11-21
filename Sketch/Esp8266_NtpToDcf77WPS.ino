@@ -48,6 +48,7 @@
 
  */
 
+#include <NTPClient.h>
 #include <ESP8266WiFi.h>
 #include <WiFiUdp.h>
 #include <Ticker.h>
@@ -58,22 +59,14 @@ extern "C" {
   #include "user_interface.h"
 }
 
-unsigned int localPort = 2390;      // local port to listen for UDP packets
+WiFiUDP ntpUDP;
+// more generic NTP server "europe.pool.ntp.org"
+// time offset 3600 => 1 hour => Central European Time
+// refresh time frequency 600000 => 10 minutes
+NTPClient timeClient(ntpUDP, "fritz.box", 3600, 600000);
 
-/* Don't hardwire the IP address or we won't get the benefits of the pool.
- *  Lookup the IP address for the host name instead */
-IPAddress timeServerIP; // time.nist.gov NTP server address
-const char* ntpServerName = "fritz.box";
-
-const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
-
-byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
-
-// A UDP instance to let us send and receive packets over UDP
-WiFiUDP udp;
-
-//udp reply missing counter
-int UdpNoReplyCounter = 0;
+// sleep duration between blocks of active transmission of time data to DCF77 receiver
+#define sleepcount 48
 
 //routine timer 100 msec
 Ticker DcfOutTimer;
@@ -89,7 +82,6 @@ Ticker DcfOutTimer;
 #define SecondMinutePulseBegin 62
 #define ThirdMinutePulseBegin 122
 
-
 //complete array of pulses for three minutes
 //0 = no pulse, 1=100msec, 2=200msec
 int PulseArray[MaxPulseNumber];
@@ -99,13 +91,11 @@ int DCFOutputOn = 0;
 int PartialPulseCount = 0;
 int ThisHour,ThisMinute,ThisSecond,ThisDay,ThisMonth,ThisYear,DayOfW;
 
-const int timeZone = 1;     // Central European Time
-
 int Dls;                    //DayLightSaving
 
 void setup()
 {
-  Serial.begin(9600);
+  Serial.begin(115200);
   Serial.println();
   Serial.println("INIT DCF77 emulator");
  
@@ -139,7 +129,7 @@ void setup()
   CheckConnection();
   // wait 10 seconds for clock to come up
   delay(10000);
- 
+  timeClient.begin();
 }
 
 void loop(){
@@ -147,26 +137,35 @@ void loop(){
   //check the WLAN status
   if (WiFi.status() == WL_CONNECTED)
   {
-    // word clock reads every hour. so we present a stretch of ~90 minutes signal every day
-    for (n=0;n<30;n++) {
+    // word clock reads every hour. so we present a stretch of ~75 minutes signal in every activity block
+    for (n=0;n<25;n++) {
       ReadAndDecodeTime();
-      delay(60000);
+      delay(6000);
       if (WiFi.status() != WL_CONNECTED)
         break;
     };
     WiFi.mode( WIFI_OFF );
     WiFi.forceSleepBegin();
-    // wait 20 hours
-    delay(72000000);
+    delay(1);
+    Serial.println("Beginne Ruhezustand.");
+    // wait between blocks of active transmission
+    for (n=0;n<sleepcount;n++) {
+      Serial.printf("Aufwachen in %d Minuten.\n", (sleepcount - n) * 10);
+      delay(600000);   //10 Minuten
+    }
+    Serial.println("Ende Ruhezustand.");
+    Serial.printf("\nVersuche Verbindung mit gespeicherter SSID '%s'\n", WiFi.SSID().c_str());
     WiFi.forceSleepWake();
-    delay( 10 );
+    delay(1);
+    WiFi.mode( WIFI_STA );
     WiFi.begin();
     AwaitConnection();
+    Serial.println();
   }
   else
   {
-    // wait 10 Minutes
-    delay(600000);
+    // wait 1 Minute
+    delay(60000);
     ReconnectToWiFi();
   }
 }
@@ -247,165 +246,128 @@ bool startWPS() {
 }
 
 void ReadAndDecodeTime() {
+    int DayToEndOfMonth,DayOfWeekToEnd,DayOfWeekToSunday;
 
-  int DayToEndOfMonth,DayOfWeekToEnd,DayOfWeekToSunday;
+    //get a random server from the pool
+    timeClient.update();
 
-  //get a random server from the pool
-  WiFi.hostByName(ntpServerName, timeServerIP); 
-
-  Serial.println("Starting UDP");
-  udp.begin(localPort);
-  Serial.print("Local port: ");
-  Serial.println(udp.localPort());
-
-  sendNTPpacket(timeServerIP); // send an NTP packet to a time server
-  // wait to see if a reply is available
-  delay(1000);
+    // avoid sending the wrong time
+    if(timeClient.isTimeSet()) {
+     
+      // now convert NTP time into everyday time:
+      Serial.print("Unix time = ");
+      //note: we add two minutes because the dcf protocol send the time of the FOLLOWING minute
+      //and our transmission begins the next minute more
+      time_t ThisTime = timeClient.getEpochTime() + 120;
+      // print Unix time:
+      Serial.println(ThisTime);
   
-  int cb = udp.parsePacket();
-  if (!cb) {
-    Serial.println("no packet yet");
-    //try max 3 times (every minute) after that we force the wifi to reconnect
-    if (UdpNoReplyCounter++ == 3){
-      Serial.println("Too many UDP errors, starting to reconnect.");
-      ReconnectToWiFi();
-      UdpNoReplyCounter = 0;
-    };
-  } else {
-    UdpNoReplyCounter = 0;
-    Serial.print("packet received, length=");
-    Serial.println(cb);
-    // We've received a packet, read the data from it
-    udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
-
-    //the timestamp starts at byte 40 of the received packet and is four bytes,
-    // or two words, long. First, esxtract the two words:
-
-    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-    // combine the four bytes (two words) into a long integer
-    // this is NTP time (seconds since Jan 1 1900):
-    unsigned long secsSince1900 = highWord << 16 | lowWord;
-    Serial.print("Seconds since Jan 1 1900 = " );
-    Serial.println(secsSince1900);
-
-    // now convert NTP time into everyday time:
-    Serial.print("Unix time = ");
-    // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
-    const unsigned long seventyYears = 2208988800UL;
-    // subtract seventy years:
-    //note: we add two minutes because the dcf protocol send the time of the FOLLOWING minute
-    //and our transmission begins the next minute more
-    time_t ThisTime = secsSince1900 - seventyYears + ( timeZone * 3600 ) + 120;
-    // print Unix time:
-    Serial.println(ThisTime);
-
-    //calculate actual day to evaluate the summer/winter time of day ligh saving
-    DayOfW = weekday(ThisTime);
-    ThisDay = day(ThisTime);
-    ThisMonth = month(ThisTime);
-    ThisYear = year(ThisTime);
-    Serial.print("Local time");       // UTC is the time at Greenwich Meridian (GMT)
-    Serial.print(ThisDay);
-    Serial.print('/');
-    Serial.print(ThisMonth);
-    Serial.print('/');
-    Serial.print(ThisYear);
-    Serial.print(' ');
-  
-    //check daylight saving
-    Dls = 0;    //default winter time
-    //From April to september we are surely on summer time
-    if (ThisMonth > 3 && ThisMonth < 10) {
-      Dls = 1;
-    };
-    //March, month of change winter->summer time, last Sunday of the month
-    //March has 31 days so from 25 included on Sunday we can be in summer time
-    if (ThisMonth == 3 && ThisDay > 24) {
-      DayToEndOfMonth = 31 - ThisDay;
-      DayOfWeekToSunday = 7 - DayOfW;
-      if (DayOfWeekToSunday >= DayToEndOfMonth)
+      //calculate actual day to evaluate the summer/winter time of day ligh saving
+      DayOfW = weekday(ThisTime);
+      ThisDay = day(ThisTime);
+      ThisMonth = month(ThisTime);
+      ThisYear = year(ThisTime);
+      Serial.print("Local time ");       // UTC is the time at Greenwich Meridian (GMT)
+      Serial.print(ThisDay);
+      Serial.print('/');
+      Serial.print(ThisMonth);
+      Serial.print('/');
+      Serial.print(ThisYear);
+      Serial.print(' ');
+    
+      //check daylight saving
+      Dls = 0;    //default winter time
+      //From April to september we are surely on summer time
+      if (ThisMonth > 3 && ThisMonth < 10) {
         Dls = 1;
-    };
-    //October, month of change summer->winter time, last Sunday of the month
-    //October has 31 days so from 25 included on Sunday we can be in winter time
-    if (ThisMonth == 10) {
-      Dls = 1;
-      if (ThisDay > 24) {
-        DayToEndOfMonth = 31 - ThisDay;
-        DayOfWeekToEnd = 7 - DayOfW;
-        if (DayOfWeekToEnd >= DayToEndOfMonth)
-        Dls = 0;
       };
-    };
-
-    Serial.print("Dls:");
-    Serial.print(Dls);
-    Serial.print(' ');
-    //add one hour if we are in summer time
-    if (Dls == 1)
-      ThisTime += 3600;
-
-    //now that we know the dls state, we can calculate the time to
-    // print the hour, minutes and seconds:
-    ThisHour = hour(ThisTime);
-    ThisMinute = minute(ThisTime);
-    ThisSecond = second(ThisTime);
-    Serial.print(ThisHour); // print the hour
-    Serial.print(':');
-    Serial.print(ThisMinute); // print the minute
-    Serial.print(':');
-    Serial.println(ThisSecond); // print the second
-
-    //if we are over about the 56° second we risk to begin the pulses too late, so it's better
-    //to skip at the half of the next minute and NTP+recalculate all again
-    if (ThisSecond > 56){
-      delay(30000);
-      return;      
+      //March, month of change winter->summer time, last Sunday of the month
+      //March has 31 days so from 25 included on Sunday we can be in summer time
+      if (ThisMonth == 3 && ThisDay > 24) {
+        DayToEndOfMonth = 31 - ThisDay;
+        DayOfWeekToSunday = 7 - DayOfW;
+        if (DayOfWeekToSunday >= DayToEndOfMonth)
+          Dls = 1;
+      };
+      //October, month of change summer->winter time, last Sunday of the month
+      //October has 31 days so from 25 included on Sunday we can be in winter time
+      if (ThisMonth == 10) {
+        Dls = 1;
+        if (ThisDay > 24) {
+          DayToEndOfMonth = 31 - ThisDay;
+          DayOfWeekToEnd = 7 - DayOfW;
+          if (DayOfWeekToEnd >= DayToEndOfMonth)
+          Dls = 0;
+        };
+      };
+  
+      Serial.print("Dls:");
+      Serial.print(Dls);
+      Serial.print(' ');
+      //add one hour if we are in summer time
+      if (Dls == 1)
+        ThisTime += 3600;
+  
+      //now that we know the dls state, we can calculate the time to
+      // print the hour, minutes and seconds:
+      ThisHour = hour(ThisTime);
+      ThisMinute = minute(ThisTime);
+      ThisSecond = second(ThisTime);
+      Serial.print(ThisHour); // print the hour
+      Serial.print(':');
+      Serial.print(ThisMinute); // print the minute
+      Serial.print(':');
+      Serial.println(ThisSecond); // print the second
+  
+      //if we are over about the 56° second we risk to begin the pulses too late, so it's better
+      //to skip at the half of the next minute and NTP+recalculate all again
+      if (ThisSecond > 56){
+        delay(30000);
+        return;      
+      }
+  
+      //calculate bis array for the first minute
+      CalculateArray(FirstMinutePulseBegin);
+  
+      //add one minute and calculate array again for the second minute
+      ThisTime += 60;
+      DayOfW = weekday(ThisTime);
+      ThisDay = day(ThisTime);
+      ThisMonth = month(ThisTime);
+      ThisYear = year(ThisTime);
+      ThisHour = hour(ThisTime);
+      ThisMinute = minute(ThisTime);
+      ThisSecond = second(ThisTime);
+      CalculateArray(SecondMinutePulseBegin);
+  
+      //one minute more for the third minute
+      ThisTime += 60;
+      DayOfW = weekday(ThisTime);
+      ThisDay = day(ThisTime);
+      ThisMonth = month(ThisTime);
+      ThisYear = year(ThisTime);
+      ThisHour = hour(ThisTime);
+      ThisMinute = minute(ThisTime);
+      ThisSecond = second(ThisTime);
+      CalculateArray(ThirdMinutePulseBegin);
+  
+     
+      //how many to the minute end ?
+      //don't forget that we begin transmission at second 58°
+      int SkipSeconds = 58 - ThisSecond;
+      delay(SkipSeconds * 1000);
+      //begin
+      DCFOutputOn = 1;
+  
+      //three minutes are needed to transmit all the packet
+      //then wait more 30 secs to locate safely at the half of minute
+      //NB 150+60=210sec, 60secs are lost from main routine
+      delay(150000);
     }
-
-    //calculate bis array for the first minute
-    CalculateArray(FirstMinutePulseBegin);
-
-    //add one minute and calculate array again for the second minute
-    ThisTime += 60;
-    DayOfW = weekday(ThisTime);
-    ThisDay = day(ThisTime);
-    ThisMonth = month(ThisTime);
-    ThisYear = year(ThisTime);
-    ThisHour = hour(ThisTime);
-    ThisMinute = minute(ThisTime);
-    ThisSecond = second(ThisTime);
-    CalculateArray(SecondMinutePulseBegin);
-
-    //one minute more for the third minute
-    ThisTime += 60;
-    DayOfW = weekday(ThisTime);
-    ThisDay = day(ThisTime);
-    ThisMonth = month(ThisTime);
-    ThisYear = year(ThisTime);
-    ThisHour = hour(ThisTime);
-    ThisMinute = minute(ThisTime);
-    ThisSecond = second(ThisTime);
-    CalculateArray(ThirdMinutePulseBegin);
-
-   
-    //how many to the minute end ?
-    //don't forget that we begin transmission at second 58°
-    int SkipSeconds = 58 - ThisSecond;
-    delay(SkipSeconds * 1000);
-    //begin
-    DCFOutputOn = 1;
-
-    //three minutes are needed to transmit all the packet
-    //then wait more 30 secs to locate safely at the half of minute
-    //NB 150+60=210sec, 60secs are lost from main routine
-    delay(150000);
-
-  };
-
-  udp.stop() ;
-
+    else
+    {
+      Serial.println("No time received via NTP. Sending no DCF signal.");
+    }
 }
 
 
@@ -500,33 +462,6 @@ void CalculateArray(int ArrayOffset) {
     Serial.print(PulseArray[n+ArrayOffset]);*/
 
 }
-
-
-// send an NTP request to the time server at the given address
-unsigned long sendNTPpacket(IPAddress& address)
-{
-  Serial.println("sending NTP packet...");
-  // set all bytes in the buffer to 0
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49;
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
-
-  // all NTP fields have been given values, now
-  // you can send a packet requesting a timestamp:
-  udp.beginPacket(address, 123); //NTP requests are to port 123
-  udp.write(packetBuffer, NTP_PACKET_SIZE);
-  udp.endPacket();
-}
-
 
 //called every 100msec
 //for DCF77 output
